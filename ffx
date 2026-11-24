@@ -1,0 +1,1109 @@
+#!/bin/sh
+# ffx — Firefox 多用途启动器 / 桌面项管理器
+#
+#   ffx menu                                 交互式菜单（等价于不带参数的 ./install.sh）
+#   ffx run [选项] [--] [firefox 参数...]   直接启动，不写任何文件
+#   ffx install [选项]                       生成 wrapper + .desktop（+ 可选桌面快捷方式）
+#   ffx uninstall <id|all>                   移除本工具生成的东西
+#   ffx list                                 列出已生成的启动项
+#   ffx doctor                               诊断：为什么没模糊 / 哪个快捷方式没走补丁
+#   ffx icons                                列出可用的图标（icons/ 目录）
+#
+# 选项:
+#   --blur / --no-blur     是否注入背景模糊（默认 blur）
+#   --radius N             FFBLUR_RADIUS + CSS border-radius 挖圆角
+#   --opacity 0.8          ffx css 用的背景不透明度（越小越透）
+#   --content-transparent  ffx css：网页区域也透出桌面
+#   --icon PATH|NAME       图标：图片路径（会被复制到 ~/.local/share/icons/ffx）或主题图标名
+#   --name NAME            显示名称
+#   --id ID                桌面项 id（默认 firefox-blur）
+#   --profile DIR          Firefox profile 目录
+#   --args "字符串"        额外参数，如 "--new-window"
+#   --shadow               同时生成 ~/.local/bin/firefox 影子（让 firefox 命令本身生效）
+#   --desktop              同时生成桌面快捷方式
+#   --force                覆盖已存在但非本工具生成的文件
+#   --no-menu              只生成 wrapper，不写 .desktop
+set -eu
+
+VERSION=1.2
+MARK='installed-by-ffx'
+
+PREFIX=${PREFIX:-$HOME/.local}
+LIB=$PREFIX/lib/ffblur/libffblur.so
+BIN=$PREFIX/bin
+APPS=$PREFIX/share/applications
+ICONS=$PREFIX/share/icons/ffx
+SELF=$(readlink -f "$0")
+SELF_DIR=$(dirname "$SELF")
+RES_PREFIX=${FFX_RESOURCES:-$PREFIX/share/ffblur}
+
+# 仓库里直接跑：图标和 .so 就在旁边；装到 PATH 后：在 share/ffblur 下
+if [ -f "$SELF_DIR/libffblur.so" ] && [ -d "$SELF_DIR/icons" ]; then
+	RES=$SELF_DIR
+elif [ -f "$RES_PREFIX/libffblur.so" ] || [ -d "$RES_PREFIX/icons" ]; then
+	RES=$RES_PREFIX
+else
+	RES=$SELF_DIR
+fi
+
+desktop_dir() {
+	d=$(xdg-user-dir DESKTOP 2>/dev/null || true)
+	[ -n "${d:-}" ] && [ -d "$d" ] && {
+		echo "$d"
+		return
+	}
+	[ -d "$HOME/桌面" ] && {
+		echo "$HOME/桌面"
+		return
+	}
+	echo "$HOME/Desktop"
+}
+DESK=$(desktop_dir)
+
+die() {
+	echo "ffx: $*" >&2
+	exit 1
+}
+
+usage() {
+	cat <<'EOF'
+ffx — Firefox 多用途启动器 / 桌面项管理器
+
+  ffx menu                                 交互式菜单（等价于不带参数的 ./install.sh）
+  ffx run [选项] [--] [firefox 参数...]   直接启动，不写任何文件
+  ffx install [选项]                       生成 wrapper + .desktop（+ 可选桌面快捷方式）
+  ffx uninstall <id|all>                   移除本工具生成的东西
+  ffx list                                 列出已生成的启动项
+  ffx doctor                               诊断：为什么没模糊 / 哪个快捷方式没走补丁
+  ffx icons [目录]                         列出可用图标
+  ffx css [show|install|remove]            管理 userChrome.css 的半透明背景
+  ffx setup                                把 ffx 装到 PATH（~/.local/bin）+ 补全
+  ffx version                              版本与资源状态
+  ffx help                                 本帮助
+
+环境变量: PREFIX（默认 ~/.local）、FFX_RESOURCES（图标/库目录）
+
+选项:
+  --blur / --no-blur     是否注入背景模糊（默认 blur）
+  --radius N             FFBLUR_RADIUS + CSS border-radius 挖圆角
+  --opacity 0.8          ffx css 用的背景不透明度（越小越透）
+  --content-transparent  ffx css：网页区域也透出桌面
+  --icon PATH|NAME       图标：图片路径（复制进 ~/.local/share/icons/ffx）或主题图标名
+  --name NAME            显示名称
+  --id ID                桌面项 id（默认 firefox-blur）
+  --profile DIR          Firefox profile 目录
+  --args "字符串"        额外参数，如 "--new-window"
+  --shadow               同时生成 ~/.local/bin/firefox 影子（让 firefox 命令本身生效）
+  --desktop              同时生成桌面快捷方式
+  --force                覆盖已存在但非本工具生成的文件
+  --no-menu              只生成 wrapper，不写 .desktop
+  --debug                让补丁打印调试信息
+EOF
+}
+
+# ---------------------------------------------------------------- helpers
+
+real_firefox() {
+	for c in /usr/bin/firefox /usr/local/bin/firefox /opt/firefox/firefox; do
+		if [ -x "$c" ] && ! grep -q "$MARK" "$c" 2>/dev/null; then
+			echo "$c"
+			return 0
+		fi
+	done
+	old=$IFS
+	IFS=:
+	for d in $PATH; do
+		[ "$d" = "$BIN" ] && continue
+		if [ -x "$d/firefox" ] && ! grep -q "$MARK" "$d/firefox" 2>/dev/null; then
+			echo "$d/firefox"
+			IFS=$old
+			return 0
+		fi
+	done
+	IFS=$old
+	return 1
+}
+
+need_lib() {
+	if [ ! -f "$LIB" ]; then
+		_src=
+		for _c in "$RES/libffblur.so" "$SELF_DIR/libffblur.so"; do
+			[ -f "$_c" ] && {
+				_src=$_c
+				break
+			}
+		done
+		[ -n "$_src" ] || die "缺少 $LIB，也找不到可复制的 libffblur.so（在仓库里先跑 make）"
+		mkdir -p "$(dirname "$LIB")"
+		install -m644 "$_src" "$LIB"
+		echo "library : $LIB"
+	fi
+	if [ "$(head -c 4 "$LIB" | od -An -tx1 | tr -d ' \n')" != 7f454c46 ]; then
+		die "$LIB 不是有效的 ELF 文件"
+	fi
+}
+
+noquote() {
+	case "$1" in
+	*\'*) die "参数里不能有单引号: $1" ;;
+	esac
+}
+
+# $1=图片路径或图标名, $2=id -> 输出 Icon= 该用的值
+resolve_icon() {
+	_icon=$1
+	_id=$2
+	# 先当预设名找（icons/<name>.png 等），找不到再当主题图标名
+	if [ ! -f "$_icon" ]; then
+		for _cand in "$RES/icons/$_icon.png" "$RES/icons/$_icon.ico" \
+			"$RES/icons/$_icon.svg"; do
+			if [ -f "$_cand" ]; then
+				_icon=$_cand
+				break
+			fi
+		done
+	fi
+	case $_icon in
+	*/*)
+		[ -f "$_icon" ] || die "图标不存在: $_icon（ffx icons 可看预设）"
+		mkdir -p "$ICONS"
+		_ext=${_icon##*.}
+		case $_ext in
+		png | svg | ico | jpg | jpeg | webp | xpm) ;;
+		*) _ext=png ;;
+		esac
+		_dst=$ICONS/$_id.$_ext
+		cp -f "$_icon" "$_dst"
+		echo "$_dst"
+		;;
+	*) echo "$_icon" ;;
+	esac
+}
+
+write_wrapper() { # $1=path $2=id $3=real
+	_path=$1
+	_id=$2
+	_real=$3
+	{
+		echo '#!/bin/sh'
+		echo "# $MARK id=$_id"
+		if [ "$opt_blur" = 1 ]; then
+			printf "exec env LD_PRELOAD='%s'" "$LIB"
+			[ -n "$opt_radius" ] && printf " FFBLUR_RADIUS='%s'" "$opt_radius"
+			[ -n "$opt_debug" ] && printf " FFBLUR_DEBUG=1"
+			printf " '%s'" "$_real"
+		else
+			printf "exec '%s'" "$_real"
+		fi
+		[ -n "$opt_profile" ] && printf " --profile '%s'" "$opt_profile"
+		[ -n "$opt_args" ] && printf " %s" "$opt_args"
+		printf ' "$@"\n'
+	} >"$_path"
+	chmod 755 "$_path"
+}
+
+write_entry() { # $1=target file $2=id $3=name $4=icon $5=exec
+	_f=$1
+	_id=$2
+	_name=$3
+	_icon=$4
+	_exec=$5
+	mkdir -p "$(dirname "$_f")"
+	{
+		echo '[Desktop Entry]'
+		echo 'Type=Application'
+		echo 'Version=1.0'
+		echo "Name=$_name"
+		echo 'Comment=Firefox (blur via ext-background-effect-v1)'
+		echo "Exec=$_exec %u"
+		echo "Icon=$_icon"
+		echo 'Terminal=false'
+		echo 'StartupNotify=true'
+		echo 'StartupWMClass=firefox'
+		echo 'Categories=Network;WebBrowser;'
+		echo 'MimeType=text/html;text/xml;application/xhtml+xml;application/xml;x-scheme-handler/http;x-scheme-handler/https;'
+		echo 'Actions=NewWindow;PrivateWindow;'
+		echo
+		echo '[Desktop Action NewWindow]'
+		echo 'Name=New Window'
+		echo "Exec=$_exec --new-window %u"
+		echo
+		echo '[Desktop Action PrivateWindow]'
+		echo 'Name=New Private Window'
+		echo "Exec=$_exec --private-window %u"
+		echo
+		echo "# $MARK id=$_id"
+	} >"$_f"
+	chmod 755 "$_f"
+}
+
+check_target() { # $1=file
+	if [ -f "$1" ] && ! grep -q "$MARK" "$1"; then
+		[ "$opt_force" = 1 ] || die "$1 已存在且不是本工具生成的，加 --force 才覆盖"
+	fi
+}
+
+# ---------------------------------------------------------------- commands
+
+cmd_run() {
+	_real=$(real_firefox) || die "找不到真正的 firefox"
+	if [ "$opt_blur" = 1 ]; then
+		need_lib
+		[ -n "$opt_radius" ] && export FFBLUR_RADIUS="$opt_radius"
+		[ -n "$opt_debug" ] && export FFBLUR_DEBUG=1
+		if [ -n "$opt_profile" ]; then
+			exec env LD_PRELOAD="$LIB${LD_PRELOAD:+:$LD_PRELOAD}" "$_real" --profile "$opt_profile" $opt_args "$@"
+		else
+			exec env LD_PRELOAD="$LIB${LD_PRELOAD:+:$LD_PRELOAD}" "$_real" $opt_args "$@"
+		fi
+	else
+		if [ -n "$opt_profile" ]; then
+			exec "$_real" --profile "$opt_profile" $opt_args "$@"
+		else
+			exec "$_real" $opt_args "$@"
+		fi
+	fi
+}
+
+cmd_install() {
+	need_lib
+	_real=$(real_firefox) || die "找不到真正的 firefox"
+	[ -n "$opt_name" ] || {
+		if [ "$opt_id" = firefox ]; then opt_name=Firefox; else opt_name='Firefox (blur)'; fi
+	}
+	mkdir -p "$BIN"
+
+	wrapper=$BIN/ffx-$opt_id
+	write_wrapper "$wrapper" "$opt_id" "$_real"
+	echo "wrapper : $wrapper"
+
+	icon=$(resolve_icon "${opt_icon:-firefox}" "$opt_id")
+
+	if [ "$opt_no_menu" = 0 ]; then
+		entry=$APPS/$opt_id.desktop
+		check_target "$entry"
+		write_entry "$entry" "$opt_id" "$opt_name" "$icon" "$wrapper"
+		echo "menu    : $entry"
+	fi
+
+	if [ "$opt_desktop" = 1 ]; then
+		dentry=$DESK/$opt_id.desktop
+		check_target "$dentry"
+		write_entry "$dentry" "$opt_id" "$opt_name" "$icon" "$wrapper"
+		echo "desktop : $dentry"
+	fi
+
+	if [ "$opt_shadow" = 1 ]; then
+		if [ -f "$BIN/firefox" ] && ! grep -q "$MARK" "$BIN/firefox"; then
+			cp -p "$BIN/firefox" "$BIN/firefox.bak"
+			echo "backup  : $BIN/firefox.bak"
+		fi
+		write_wrapper "$BIN/firefox" firefox "$_real"
+		echo "shadow  : $BIN/firefox -> $_real"
+	fi
+
+	case ":$PATH:" in
+	*":$BIN:"*) ;;
+	*) echo "note    : $BIN 不在 PATH 里，终端用需自行添加" ;;
+	esac
+}
+
+cmd_uninstall() {
+	_id=${1:-}
+	[ -n "$_id" ] || die "用法: ffx uninstall <id|all>"
+	if [ "$_id" = all ]; then
+		_n=0
+		for f in "$APPS"/*.desktop "$DESK"/*.desktop; do
+			[ -f "$f" ] || continue
+			grep -q "$MARK" "$f" 2>/dev/null || continue
+			rm -f "$f"
+			_n=$((_n + 1))
+		done
+		for w in "$BIN"/ffx-*; do
+			[ -f "$w" ] || continue
+			grep -q "$MARK" "$w" 2>/dev/null && rm -f "$w" && _n=$((_n + 1))
+		done
+		[ -f "$BIN/firefox" ] && grep -q "$MARK" "$BIN/firefox" && rm -f "$BIN/firefox" && _n=$((_n + 1))
+		echo "removed $_n file(s)"
+	else
+		for f in "$APPS/$_id.desktop" "$DESK/$_id.desktop" "$BIN/ffx-$_id"; do
+			[ -f "$f" ] || continue
+			grep -q "$MARK" "$f" 2>/dev/null || continue
+			rm -f "$f"
+			echo "removed $f"
+		done
+		if [ "$_id" = firefox ] && [ -f "$BIN/firefox" ] && grep -q "$MARK" "$BIN/firefox"; then
+			rm -f "$BIN/firefox"
+			echo "removed $BIN/firefox"
+		fi
+	fi
+}
+
+cmd_list() {
+	_found=0
+	for f in "$APPS"/*.desktop "$DESK"/*.desktop; do
+		[ -f "$f" ] || continue
+		grep -q "$MARK" "$f" 2>/dev/null || continue
+		_found=1
+		_id=$(sed -n 's/^# installed-by-ffx id=//p' "$f" | head -1)
+		_name=$(sed -n 's/^Name=//p' "$f" | head -1)
+		_exec=$(sed -n 's/^Exec=//p' "$f" | head -1)
+		_icon=$(sed -n 's/^Icon=//p' "$f" | head -1)
+		printf '%-14s %-20s %s\n' "$_id" "$_name" "$f"
+		printf '%-14s exec: %s\n' "" "$_exec"
+		printf '%-14s icon: %s\n' "" "$_icon"
+	done
+	[ "$_found" = 1 ] || echo "no entries installed"
+}
+
+cmd_doctor() {
+	echo "== 会话 =="
+	echo "  session : ${XDG_SESSION_TYPE:-?}   WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-<none>}"
+	echo "  desktop : ${XDG_CURRENT_DESKTOP:-?}"
+
+	echo "== 合成器协议 =="
+	if command -v wayland-info >/dev/null 2>&1; then
+		if wayland-info 2>/dev/null | grep -q ext_background_effect_manager_v1; then
+			echo "  ext_background_effect_manager_v1 : 有"
+		else
+			echo "  ext_background_effect_manager_v1 : 没有（合成器不支持或未启用 blur 效果）"
+		fi
+	else
+		echo "  wayland-info 未安装，跳过"
+	fi
+
+	echo "== 补丁库 =="
+	if [ -f "$LIB" ]; then
+		if [ "$(head -c 4 "$LIB" | od -An -tx1 | tr -d ' \n')" = 7f454c46 ]; then
+			echo "  $LIB : ELF ok"
+		else
+			echo "  $LIB : 不是 ELF（损坏）"
+		fi
+	else
+		echo "  $LIB : 缺失（跑 make 然后 ffx install）"
+	fi
+
+	echo "== Firefox =="
+	if _real=$(real_firefox); then
+		echo "  binary : $_real"
+		_dir=$(dirname "$(readlink -f "$_real")")
+		if [ -f "$_dir/libxul.so" ] && grep -aq background_effect "$_dir/libxul.so"; then
+			echo "  自身支持 ext-background-effect : 是（不再需要本补丁）"
+		else
+			echo "  自身支持 ext-background-effect : 否（需要本补丁）"
+		fi
+	else
+		echo "  找不到真正的 firefox 二进制"
+	fi
+
+	echo "== 窗口透明度（userChrome.css） =="
+	if _pf=$(firefox_profile 2>/dev/null); then
+		echo "  profile : $_pf"
+		if grep -q '^/\* >>> ffx-translucent' "$_pf/chrome/userChrome.css" 2>/dev/null; then
+			echo "  半透明  : 已启用 $(grep -m1 '^/\* >>> ffx-translucent' "$_pf/chrome/userChrome.css" | sed 's|/\* >>> ffx-translucent ||; s| >>> \*/||')"
+		else
+			echo "  半透明  : 未启用（ffx 没写过；若你自己写过 userChrome.css 请忽略）"
+		fi
+		if grep -q 'toolkit.legacyUserProfileCustomizations.stylesheets", true' "$_pf/prefs.js" 2>/dev/null ||
+			grep -q 'toolkit.legacyUserProfileCustomizations' "$_pf/user.js" 2>/dev/null; then
+			echo "  legacy  : 开（userChrome.css 会被加载）"
+		else
+			echo "  legacy  : 关（userChrome.css 不会加载）"
+		fi
+	else
+		echo "  找不到 profile"
+	fi
+
+	echo "== 已安装的启动项 =="
+	_n=0
+	for f in "$APPS"/*.desktop "$DESK"/*.desktop; do
+		[ -f "$f" ] || continue
+		grep -q "$MARK" "$f" 2>/dev/null || continue
+		_n=$((_n + 1))
+		_exec=$(sed -n 's/^Exec=//p' "$f" | head -1 | awk '{print $1}')
+		_icon=$(sed -n 's/^Icon=//p' "$f" | head -1)
+		_st=ok
+		[ -x "$_exec" ] || _st="Exec 不存在: $_exec"
+		grep -q LD_PRELOAD "$_exec" 2>/dev/null || _st="$_st（未注入 LD_PRELOAD）"
+		case $_icon in
+		/*) [ -f "$_icon" ] || _st="$_st（图标缺失）" ;;
+		esac
+		printf '  %s\n    %s\n' "$f" "$_st"
+	done
+	[ "$_n" -gt 0 ] || echo "  （无）"
+
+	echo "== 可疑的 firefox 快捷方式 =="
+	_warn=0
+	for f in "$DESK"/*.desktop; do
+		[ -f "$f" ] || continue
+		grep -q "$MARK" "$f" 2>/dev/null && continue
+		grep -qi 'firefox' "$f" 2>/dev/null || continue
+		_exec=$(sed -n 's/^Exec=//p' "$f" | head -1)
+		case $_exec in
+		*ffx-* | *"$BIN"/firefox*) ;;
+		*)
+			echo "  $f"
+			echo "    Exec=$_exec  <- 没走补丁，点了不会有模糊"
+			_warn=1
+			;;
+		esac
+	done
+	[ "$_warn" = 1 ] || echo "  （无）"
+}
+
+cmd_icons() {
+	_dir=${1:-$RES/icons}
+	if [ ! -d "$_dir" ]; then
+		echo "icons 目录不存在: $_dir" >&2
+		return 0
+	fi
+	_n=0
+	for f in "$_dir"/*.png; do
+		[ -f "$f" ] || continue
+		_n=$((_n + 1))
+		_name=$(basename "$f" .png)
+		_size=$(magick "$f" -format '%wx%h' info: 2>/dev/null || echo '?')
+		printf '  %-14s %s\n' "$_name" "$_size"
+	done
+	[ "$_n" -gt 0 ] || echo "  （$SELF_DIR/icons 里没有 .png 预设，可自己丢图片进去）"
+	echo
+	echo "用法: ffx install --icon <预设名> ..."
+}
+
+cmd_setup() {
+	[ -f "$RES/libffblur.so" ] || die "找不到 $RES/libffblur.so（在仓库里先 make）"
+	[ -d "$RES/icons" ] || die "找不到 $RES/icons"
+	mkdir -p "$BIN" "$PREFIX/lib/ffblur" "$PREFIX/share/ffblur"
+
+	install -m755 "$SELF" "$BIN/ffx"
+	echo "cli     : $BIN/ffx"
+	install -m644 "$RES/libffblur.so" "$PREFIX/lib/ffblur/libffblur.so"
+	echo "library : $PREFIX/lib/ffblur/libffblur.so"
+	mkdir -p "$PREFIX/share/ffblur/icons"
+	cp -a "$RES/icons/." "$PREFIX/share/ffblur/icons/"
+	echo "icons   : $PREFIX/share/ffblur/icons"
+
+	_src=$SELF_DIR/completions
+	[ -d "$_src" ] || _src=$RES/completions
+	if [ -d "$_src" ]; then
+		mkdir -p "$PREFIX/share/bash-completion/completions" \
+			"$PREFIX/share/zsh/site-functions" \
+			"$PREFIX/share/fish/vendor_completions.d"
+		[ -f "$_src/ffx.bash" ] && install -m644 "$_src/ffx.bash" \
+			"$PREFIX/share/bash-completion/completions/ffx"
+		[ -f "$_src/_ffx" ] && install -m644 "$_src/_ffx" \
+			"$PREFIX/share/zsh/site-functions/_ffx"
+		[ -f "$_src/ffx.fish" ] && install -m644 "$_src/ffx.fish" \
+			"$PREFIX/share/fish/vendor_completions.d/ffx.fish"
+		echo "shell   : 补全已装（bash / zsh / fish）"
+	fi
+
+	case ":$PATH:" in
+	*":$BIN:"*) echo; echo "现在可以直接用: ffx --help" ;;
+	*) echo; echo "把 $BIN 加进 PATH 后即可直接用 ffx："\
+		"echo 'export PATH=\$HOME/.local/bin:\$PATH' >> ~/.bashrc" ;;
+	esac
+}
+
+cmd_version() {
+	echo "ffx $VERSION"
+	echo "resources: $RES"
+	if [ -f "$LIB" ]; then
+		echo "library  : $LIB"
+	elif [ -f "$RES/libffblur.so" ]; then
+		echo "library  : $RES/libffblur.so（还没落到 lib/ffblur）"
+	else
+		echo "library  : 缺失"
+	fi
+	if [ -d "$RES/icons" ]; then
+		echo "presets  : $(ls "$RES/icons"/*.png 2>/dev/null | wc -l) 个"
+	fi
+}
+
+
+# ---------------------------------------------------------------- 交互菜单
+
+_c_bold=$([ -t 1 ] && printf '\033[1m' || true)
+_c_dim=$([ -t 1 ] && printf '\033[2m' || true)
+_c_off=$([ -t 1 ] && printf '\033[0m' || true)
+
+say() { printf '%s\n' "$*"; }
+hdr() { say "${_c_bold}$*${_c_off}"; }
+dim() { say "${_c_dim}$*${_c_off}"; }
+
+ask() { # $1=提示 $2=默认值；提示走 stderr，答案走 stdout，便于 $(...)
+	printf '%s' "$1" >&2
+	read -r _a || _a=
+	if [ -z "$_a" ]; then _a=$2; fi
+	printf '%s' "$_a"
+}
+
+presets() {
+	for f in "$RES"/icons/*.png; do
+		[ -f "$f" ] && basename "$f" .png
+	done
+}
+
+# 某个 .desktop 是否带模糊（wrapper 里有 LD_PRELOAD）
+entry_blur() {
+	_e=$(sed -n 's/^Exec=//p' "$1" | head -1 | awk '{print $1}')
+	[ -x "$_e" ] && grep -q LD_PRELOAD "$_e" 2>/dev/null && echo on || echo off
+}
+
+state() {
+	hdr "当前状态"
+	_n=0
+	for f in "$APPS"/*.desktop; do
+		[ -f "$f" ] || continue
+		grep -q "$MARK" "$f" 2>/dev/null || continue
+		_n=$((_n + 1))
+		say "  菜单项  $(basename "$f")  模糊=$(entry_blur "$f")  图标=$(sed -n 's/^Icon=//p' "$f" | head -1)"
+	done
+	for f in "$DESK"/*.desktop; do
+		[ -f "$f" ] || continue
+		grep -q "$MARK" "$f" 2>/dev/null || continue
+		_n=$((_n + 1))
+		say "  桌面项  $(basename "$f")  模糊=$(entry_blur "$f")"
+	done
+	if [ -f "$BIN/firefox" ] && grep -q "$MARK" "$BIN/firefox" 2>/dev/null; then
+		_n=$((_n + 1))
+		say "  命令    $BIN/firefox（影子，带模糊）"
+	fi
+	[ "$_n" -eq 0 ] && dim "  （还没有安装任何东西）"
+	_b=0
+	for b in "$APPS"/*.bak "$DESK"/*.orig "$BIN"/firefox.bak; do
+		[ -f "$b" ] && _b=$((_b + 1))
+	done
+	[ "$_b" -gt 0 ] && say "  备份    $_b 个（还原时用）"
+	return 0
+}
+
+pick_icon() {
+	hdr "选择图标" >&2
+	_i=0
+	for p in $(presets); do
+		_i=$((_i + 1))
+		dim "  $_i) $p" >&2
+	done
+	dim "  c) 保持当前图标" >&2
+	dim "  p) 输入图片路径" >&2
+	_pick=$(ask "选择 [1]: " 1)
+	case $_pick in
+	c | C) return 0 ;;
+	p | P)
+		_p=$(ask "图片路径: " "")
+		[ -n "$_p" ] && printf '%s' "$_p"
+		return 0
+		;;
+	esac
+	_j=0
+	for p in $(presets); do
+		_j=$((_j + 1))
+		[ "$_j" = "$_pick" ] && {
+			printf '%s' "$p"
+			return 0
+		}
+	done
+	dim "无效选择，保持当前图标" >&2
+}
+
+flow_apply() {
+	hdr "要做什么？"
+	say "  1) 加模糊（保持现有图标和名称）"
+	say "  2) 加模糊 + 换图标"
+	say "  3) 只换图标（不加模糊）"
+	say "  4) 新建一个独立启动项（不动现有 Firefox）"
+	_m=$(ask "选择 [1]: " 1)
+
+	opt_blur=1
+	opt_icon=
+	opt_radius=
+	opt_id=firefox
+	opt_name=Firefox
+	opt_shadow=1
+	opt_force=1
+
+	case $_m in
+	2) opt_icon=$(pick_icon) ;;
+	3) opt_blur=0; opt_icon=$(pick_icon) ;;
+	4)
+		opt_id=firefox-blur
+		opt_name="Firefox (blur)"
+		opt_shadow=0
+		;;
+	1) ;;
+	*) say "无效选择，按 1 处理" ;;
+	esac
+
+	if [ "$opt_id" = firefox ]; then
+		_n=$(ask "显示名称 [Firefox]: " "Firefox")
+		opt_name=$_n
+		_s=$(ask "让 firefox 命令本身也带模糊？[Y/n]: " y)
+		case $_s in
+		n | N) opt_shadow=0 ;;
+		*) opt_shadow=1 ;;
+		esac
+	else
+		_n=$(ask "显示名称 [Firefox (blur)]: " "Firefox (blur)")
+		opt_name=$_n
+	fi
+
+	_d=$(ask "同时更新桌面快捷方式？[Y/n]: " y)
+	case $_d in
+	n | N) opt_desktop=0 ;;
+	*) opt_desktop=1 ;;
+	esac
+
+	if [ "$opt_blur" = 1 ]; then
+		_r=$(ask "圆角半径（配合 CSS border-radius，0=不处理）[0]: " 0)
+		[ "$_r" != 0 ] && opt_radius=$_r
+	fi
+
+	hdr "即将执行"
+	say "  桌面项 id : $opt_id（$opt_name）"
+	say "  模糊      : $([ "$opt_blur" = 1 ] && echo 开 || echo 关)"
+	say "  图标      : ${opt_icon:-保持当前 / 主题默认}"
+	[ -n "$opt_radius" ] && say "  圆角      : $opt_radius px"
+	say "  firefox 命令: $([ "$opt_shadow" = 1 ] && echo 接管 || echo 不动)"
+	say "  桌面快捷方式: $([ "$opt_desktop" = 1 ] && echo 更新 || echo 不动)"
+
+	# 覆盖提醒：目标文件不是本工具生成的
+	_warn=0
+	for f in "$APPS/$opt_id.desktop" "$DESK/$opt_id.desktop"; do
+		[ -f "$f" ] && ! grep -q "$MARK" "$f" && _warn=1
+	done
+	[ "$_warn" = 1 ] && say "  注意：已存在的同名桌面项不是本工具生成的，将被覆盖（原件备份为 .bak/.orig）"
+
+	_ok=$(ask "继续？[Y/n]: " y)
+	case $_ok in
+	n | N) say "已取消"; return 0 ;;
+	esac
+
+	# 覆盖前备份用户文件
+	for f in "$APPS/$opt_id.desktop" "$DESK/$opt_id.desktop"; do
+		[ -f "$f" ] && ! grep -q "$MARK" "$f" && cp -a "$f" "$f.bak"
+	done
+
+	cmd_install
+	refresh_menu
+	say "完成。"
+	_pf=$(firefox_profile 2>/dev/null || true)
+	if [ -n "$_pf" ] && ! grep -q '^/\* >>> ffx-translucent' "$_pf/chrome/userChrome.css" 2>/dev/null; then
+		dim "提示：窗口还不是半透明，模糊看不见。菜单 4 可写入 userChrome.css。"
+	fi
+}
+
+
+flow_css() {
+	hdr "窗口半透明（userChrome.css）"
+	_pf=$(firefox_profile) || {
+		say "  找不到 Firefox profile（可用 --profile 指定）"
+		return 0
+	}
+	_css=$_pf/chrome/userChrome.css
+	say "  profile : $_pf"
+	if grep -q '^/\* >>> ffx-translucent' "$_css" 2>/dev/null; then
+		say "  当前    : $(grep -m1 '^/\* >>> ffx-translucent' "$_css")"
+	else
+		dim "  当前    : 未启用（没有半透明就看不到模糊）"
+	fi
+	echo
+	say "  1) 写入 / 更新"
+	say "  2) 移除"
+	say "  0) 返回"
+	_c=$(ask "选择 [1]: " 1)
+	case $_c in
+	1)
+		_a=$(ask "不透明度（0-1，越小越透）[0.8]: " 0.8)
+		_r=$(ask "圆角半径 px（0=不要圆角）[0]: " 0)
+		_t=$(ask "网页区域也透出桌面？[y/N]: " n)
+		opt_content=0
+		case $_t in
+		y | Y) opt_content=1 ;;
+		esac
+		opt_opacity=$_a
+		opt_radius=$_r
+		cmd_css install
+		;;
+	2) cmd_css remove ;;
+	esac
+}
+
+flow_restore() {
+	hdr "还原"
+	_n=0
+	for f in "$APPS"/*.desktop "$DESK"/*.desktop; do
+		[ -f "$f" ] || continue
+		grep -q "$MARK" "$f" 2>/dev/null && {
+			say "  移除  $f"
+			_n=$((_n + 1))
+		}
+	done
+	if [ -f "$BIN/firefox" ] && grep -q "$MARK" "$BIN/firefox" 2>/dev/null; then
+		say "  移除  $BIN/firefox"
+		_n=$((_n + 1))
+	fi
+	for b in "$APPS"/*.bak "$DESK"/*.orig "$BIN"/firefox.bak; do
+		[ -f "$b" ] && {
+			say "  恢复  $b"
+			_n=$((_n + 1))
+		}
+	done
+	if [ "$_n" -eq 0 ]; then
+		say "  没有可还原的内容。"
+		return 0
+	fi
+	_ok=$(ask "确认还原？[y/N]: " n)
+	case $_ok in
+	y | Y) ;;
+	*) say "已取消"; return 0 ;;
+	esac
+
+	cmd_uninstall all
+	_libdir=$PREFIX/lib/ffblur
+	for b in "$APPS"/*.ffblur.bak "$APPS"/*.desktop.bak; do
+		[ -f "$b" ] && mv -f "$b" "${b%.bak}" && say "  已恢复 ${b%.bak}"
+	done
+	for b in "$DESK"/*.orig; do
+		[ -f "$b" ] && mv -f "$b" "${b%.orig}" && say "  已恢复 ${b%.orig}"
+	done
+	if [ -f "$BIN/firefox.bak" ]; then
+		mv -f "$BIN/firefox.bak" "$BIN/firefox" && say "  已恢复 $BIN/firefox"
+	fi
+	refresh_menu
+	say "还原完成。补丁库仍在 $LIB（可手动 rm -r $(dirname "$LIB")）。"
+}
+
+refresh_menu() {
+	if command -v kbuildsycoca6 >/dev/null 2>&1; then
+		kbuildsycoca6 --noincremental >/dev/null 2>&1 || true
+	elif command -v update-desktop-database >/dev/null 2>&1; then
+		update-desktop-database "$APPS" >/dev/null 2>&1 || true
+	fi
+}
+
+cmd_menu() {
+	if [ ! -t 0 ] || [ ! -t 1 ]; then
+		usage
+		return 0
+	fi
+	while :; do
+		echo
+		hdr "ffx — Firefox 背景模糊 / 图标"
+		state
+		echo
+		say "请选择:"
+		say "  1) 执行（加模糊、换图标、生成启动项）"
+		say "  2) 还原（移除本工具装的东西，恢复备份）"
+		say "  3) 诊断（为什么没模糊）"
+		say "  4) 窗口半透明（改 userChrome.css）"
+		say "  0) 退出"
+		_c=$(ask "选择 [1]: " 1)
+		case $_c in
+		1) flow_apply ;;
+		2) flow_restore ;;
+		3) cmd_doctor ;;
+		4) flow_css ;;
+		0 | q | Q) return 0 ;;
+		*) say "无效选择" ;;
+		esac
+	done
+}
+
+
+# ---------------------------------------------------------------- userChrome
+
+CSS_START='/* >>> ffx-translucent'
+CSS_END='/* <<< ffx-translucent <<< */'
+
+firefox_profile() {
+	if [ -n "${opt_profile:-}" ]; then
+		printf '%s\n' "$opt_profile"
+		return 0
+	fi
+	_ini=
+	for f in "$HOME/.config/mozilla/firefox/profiles.ini" \
+		"$HOME/.mozilla/firefox/profiles.ini"; do
+		[ -f "$f" ] && {
+			_ini=$f
+			break
+		}
+	done
+	if [ -n "$_ini" ]; then
+		_base=$(dirname "$_ini")
+		# [Install*] Default=... 优先（Firefox 实际启动用的就是它）
+		_p=$(awk -F= '/^\[Install/{ins=1;next} /^\[/{ins=0} ins && $1=="Default"{print $2}' "$_ini" | head -1)
+		if [ -z "$_p" ]; then
+			# 否则找 [Profile*] 里 Default=1 的那块的 Path
+			_p=$(awk -F= '
+				/^\[Profile/ {if (insec && def==1 && path!="") print path; path=""; def=0; insec=1; next}
+				/^\[/ {if (insec && def==1 && path!="") print path; path=""; def=0; insec=0; next}
+				insec && $1=="Path" {path=$2}
+				insec && $1=="Default" {def=$2}
+				END {if (insec && def==1 && path!="") print path}
+			' "$_ini" | head -1)
+		fi
+		if [ -n "$_p" ]; then
+			case $_p in
+			/*) printf '%s\n' "$_p" ;;
+			*) printf '%s\n' "$_base/$_p" ;;
+			esac
+			return 0
+		fi
+	fi
+	# 兜底：最新的 *.default-release
+	_d=$(ls -dt "$HOME"/.config/mozilla/firefox/*.default-release \
+		"$HOME"/.mozilla/firefox/*.default-release 2>/dev/null | head -1)
+	[ -n "$_d" ] && {
+		printf '%s\n' "$_d"
+		return 0
+	}
+	return 1
+}
+
+css_ensure_pref() { # $1=profile
+	_pf=$1
+	_pref='toolkit.legacyUserProfileCustomizations.stylesheets'
+	if grep -q "\"$_pref\", true" "$_pf/prefs.js" 2>/dev/null; then
+		return 0
+	fi
+	_uj=$_pf/user.js
+	if grep -q "$_pref" "$_uj" 2>/dev/null; then
+		return 0
+	fi
+	printf 'user_pref("%s", true);\n' "$_pref" >>"$_uj"
+	echo "pref    : $_uj += $_pref"
+}
+
+css_block() { # 输出 CSS 块
+	_a=$1
+	_r=$2
+	_c=$3
+	printf '%s opacity=%s radius=%s >>> */\n' "$CSS_START" "$_a" "$_r"
+	printf '@-moz-document url(chrome://browser/content/browser.xhtml) {\n'
+	printf '  /* 顶层窗口透明，让 Wayland surface 带 alpha，露出桌面 */\n'
+	printf '  :root, #main-window, body {\n    background: transparent !important;\n  }\n'
+	printf '  /* 内层容器全部透明，避免多层 alpha 叠加越叠越不透明 */\n'
+	printf '  #tabbrowser-tabbox, #tabbrowser-tabpanels,\n'
+	printf '  #tabbrowser-tabpanels > hbox, #tabbrowser-tabpanels > hbox > browser {\n'
+	printf '    background: transparent !important;\n  }\n'
+	printf '  /* 外层的半透明底色（浅色） */\n'
+	printf '  #navigator-toolbox, #TabsToolbar, #nav-bar, #PersonalToolbar,\n'
+	printf '  #sidebar-box, #browser, .browserStack {\n'
+	printf '    background-color: rgba(255, 255, 255, %s) !important;\n  }\n' "$_a"
+	printf '  @media (prefers-color-scheme: dark) {\n'
+	printf '    #navigator-toolbox, #TabsToolbar, #nav-bar, #PersonalToolbar,\n'
+	printf '    #sidebar-box, #browser, .browserStack {\n'
+	printf '      background-color: rgba(0, 0, 0, %s) !important;\n    }\n' "$_a"
+	printf '  }\n'
+	if [ "${_c:-0}" = 1 ]; then
+		printf '  /* 网页区域也透出桌面（页面本身有背景色时仍然是不透明的） */\n'
+		printf '  #tabbrowser-tabpanels > hbox > browser {\n'
+		printf '    background-color: rgba(255, 255, 255, %s) !important;\n  }\n' "$_a"
+		printf '  @media (prefers-color-scheme: dark) {\n'
+		printf '    #tabbrowser-tabpanels > hbox > browser {\n'
+		printf '      background-color: rgba(0, 0, 0, %s) !important;\n    }\n' "$_a"
+		printf '  }\n'
+	fi
+	if [ -n "$_r" ] && [ "$_r" != 0 ]; then
+		printf '  /* 圆角（配合 ffx install --radius %s） */\n' "$_r"
+		printf '  #main-window { border-radius: %spx !important; overflow: hidden !important; }\n' "$_r"
+	fi
+	printf '}\n'
+	printf '%s\n' "$CSS_END"
+}
+
+css_upsert() { # $1=文件 $2=块
+	_f=$1
+	_b=$2
+	[ -f "$_f" ] || : >"$_f"
+	_s=$(grep -n '^/\* >>> ffx-translucent' "$_f" | head -1 | cut -d: -f1 || true)
+	_e=$(grep -n '^/\* <<< ffx-translucent' "$_f" | head -1 | cut -d: -f1 || true)
+	_tmp=$_f.ffx.$$
+	if [ -n "$_s" ] && [ -n "$_e" ] && [ "$_e" -gt "$_s" ]; then
+		head -n $((_s - 1)) "$_f" >"$_tmp"
+		printf '%s\n' "$_b" >>"$_tmp"
+		tail -n +$((_e + 1)) "$_f" >>"$_tmp"
+	else
+		cat "$_f" >"$_tmp"
+		[ -s "$_f" ] && printf '\n' >>"$_tmp"
+		printf '%s\n' "$_b" >>"$_tmp"
+	fi
+	mv "$_tmp" "$_f"
+}
+
+cmd_css() {
+	_sub=
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--opacity)
+			shift
+			opt_opacity=${1:?}
+			;;
+		--radius)
+			shift
+			opt_radius=${1:?}
+			;;
+		--profile)
+			shift
+			opt_profile=${1:?}
+			;;
+		--content-transparent) opt_content=1 ;;
+		show | install | apply | remove) _sub=$1 ;;
+		*) die "css: 未知参数 $1" ;;
+		esac
+		shift
+	done
+	_sub=${_sub:-show}
+	_a=${opt_opacity:-0.8}
+	_r=${opt_radius:-}
+	_c=${opt_content:-0}
+
+	_pf=$(firefox_profile) || die "找不到 Firefox profile（用 --profile 指定）"
+	_css=$_pf/chrome/userChrome.css
+
+	case $_sub in
+	show)
+		echo "profile : $_pf"
+		echo "css     : $_css"
+		if grep -q '^/\* >>> ffx-translucent' "$_css" 2>/dev/null; then
+			grep -n '^/\* >>> ffx-translucent' "$_css"
+			echo "状态    : 已启用"
+		else
+			echo "状态    : 未启用"
+		fi
+		;;
+	install | apply)
+		case $_a in
+		'' | *[!0-9.]*) die "透明度要 0-1 之间的小数，如 0.8" ;;
+		esac
+		[ -d "$_pf" ] || die "profile 不存在: $_pf"
+		mkdir -p "$_pf/chrome"
+		if [ -f "$_css" ] && ! grep -q '^/\* >>> ffx-translucent' "$_css"; then
+			cp -a "$_css" "$_css.ffx.bak"
+			echo "backup  : $_css.ffx.bak"
+		fi
+		css_ensure_pref "$_pf"
+		css_upsert "$_css" "$(css_block "$_a" "$_r" "$_c")"
+		echo "css     : $_css（透明度 $_a，圆角 ${_r:-0}，网页区透明=$_c）"
+		echo "提示    : 重启 Firefox 生效"
+		;;
+	remove)
+		if grep -q '^/\* >>> ffx-translucent' "$_css" 2>/dev/null; then
+			_s=$(grep -n '^/\* >>> ffx-translucent' "$_css" | head -1 | cut -d: -f1)
+			_e=$(grep -n '^/\* <<< ffx-translucent' "$_css" | head -1 | cut -d: -f1)
+			_tmp=$_css.ffx.$$
+			head -n $((_s - 1)) "$_css" >"$_tmp"
+			tail -n +$((_e + 1)) "$_css" >>"$_tmp"
+			mv "$_tmp" "$_css"
+			echo "removed : ffx 块已移除"
+			echo "提示    : 重启 Firefox 生效"
+		else
+			echo "没有 ffx 块，无需移除"
+		fi
+		;;
+	*) die "用法: ffx css [show|install|remove] [--opacity 0.8] [--radius 8] [--content-transparent] [--profile DIR]" ;;
+	esac
+}
+
+# ---------------------------------------------------------------- parsing
+
+opt_blur=1
+opt_radius=
+opt_icon=
+opt_name=
+opt_id=
+opt_profile=
+opt_args=
+opt_desktop=0
+opt_force=0
+opt_shadow=0
+opt_no_menu=0
+opt_debug=
+opt_opacity=
+opt_content=
+
+_cmd=${1:-run}
+case $_cmd in
+-h | --help | help)
+	usage
+	exit 0
+	;;
+esac
+[ $# -gt 0 ] && shift
+
+while [ $# -gt 0 ]; do
+	case $1 in
+	--blur) opt_blur=1 ;;
+	--no-blur) opt_blur=0 ;;
+	--radius)
+		shift
+		opt_radius=${1:?}
+		;;
+	--icon)
+		shift
+		opt_icon=${1:?}
+		;;
+	--name)
+		shift
+		opt_name=${1:?}
+		;;
+	--id)
+		shift
+		opt_id=${1:?}
+		;;
+	--profile)
+		shift
+		opt_profile=${1:?}
+		;;
+	--args)
+		shift
+		opt_args=${1:?}
+		;;
+	--opacity)
+		shift
+		opt_opacity=${1:?}
+		;;
+	--content-transparent) opt_content=1 ;;
+	--desktop) opt_desktop=1 ;;
+	--force) opt_force=1 ;;
+	--shadow) opt_shadow=1 ;;
+	--no-menu) opt_no_menu=1 ;;
+	--debug) opt_debug=1 ;;
+	-h | --help | help)
+		usage
+		exit 0
+		;;
+	--)
+		shift
+		break
+		;;
+	-*)
+		die "未知选项: $1"
+		;;
+	*)
+		break
+		;;
+	esac
+	shift
+done
+
+[ -n "$opt_id" ] || opt_id=firefox-blur
+for v in "$opt_radius" "$opt_icon" "$opt_name" "$opt_profile" "$opt_args" "$opt_id"; do
+	[ -n "$v" ] && noquote "$v"
+done
+
+case $_cmd in
+run) cmd_run "$@" ;;
+install) cmd_install ;;
+uninstall) cmd_uninstall "$@" ;;
+list) cmd_list ;;
+doctor) cmd_doctor ;;
+icons) cmd_icons "$@" ;;
+css) cmd_css "$@" ;;
+menu) cmd_menu ;;
+setup) cmd_setup ;;
+version | --version) cmd_version ;;
+help) usage ;;
+*) die "未知命令: $_cmd（run/install/uninstall/list/doctor/icons）" ;;
+esac

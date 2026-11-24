@@ -1,0 +1,26 @@
+# fish completion for ffx
+complete -c ffx -f
+
+complete -c ffx -n '__fish_use_subcommand' -a 'run' -d '直接启动'
+complete -c ffx -n '__fish_use_subcommand' -a 'install' -d '生成 wrapper + 桌面项'
+complete -c ffx -n '__fish_use_subcommand' -a 'uninstall' -d '移除生成的东西'
+complete -c ffx -n '__fish_use_subcommand' -a 'list' -d '列出已安装启动项'
+complete -c ffx -n '__fish_use_subcommand' -a 'doctor' -d '诊断'
+complete -c ffx -n '__fish_use_subcommand' -a 'icons' -d '列出图标预设'
+complete -c ffx -n '__fish_use_subcommand' -a 'setup' -d '安装到 PATH'
+complete -c ffx -n '__fish_use_subcommand' -a 'version' -d '版本'
+complete -c ffx -n '__fish_use_subcommand' -a 'help' -d '帮助'
+
+complete -c ffx -l blur -d '注入背景模糊（默认）'
+complete -c ffx -l no-blur -d '不注入模糊'
+complete -c ffx -l radius -x -d '圆角半径'
+complete -c ffx -l icon -x -a '(ffx icons 2>/dev/null | string match -r "^\\s+\\S+" | string trim)' -d '图标预设或路径'
+complete -c ffx -l name -x -d '显示名称'
+complete -c ffx -l id -x -d '桌面项 id'
+complete -c ffx -l profile -x -a '(__fish_complete_directories)' -d 'profile 目录'
+complete -c ffx -l args -x -d '额外参数'
+complete -c ffx -l desktop -d '生成桌面快捷方式'
+complete -c ffx -l force -d '覆盖非本工具生成的文件'
+complete -c ffx -l shadow -d '生成 ~/.local/bin/firefox 影子'
+complete -c ffx -l no-menu -d '只生成 wrapper'
+complete -c ffx -l debug -d '补丁打印调试信息'

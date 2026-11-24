@@ -1,0 +1,10 @@
+#!/bin/sh
+# Launch Firefox with the ext-background-effect-v1 runtime patch.
+# Keep this next to libffblur.so, or set FFBLUR_LIB to its full path.
+self_dir=$(dirname "$(readlink -f "$0")")
+lib=${FFBLUR_LIB:-$self_dir/libffblur.so}
+if [ ! -f "$lib" ]; then
+	echo "firefox-blur: $lib not found" >&2
+	exit 1
+fi
+exec env LD_PRELOAD="$lib${LD_PRELOAD:+:$LD_PRELOAD}" firefox "$@"

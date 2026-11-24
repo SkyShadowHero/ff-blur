@@ -1,0 +1,28 @@
+#compdef ffx
+# zsh completion for ffx
+
+_ffx() {
+	local -a cmds opts presets
+	cmds=(run install uninstall list doctor icons setup version help)
+	opts=(--blur --no-blur --radius --icon --name --id --profile --args
+		--desktop --force --shadow --no-menu --debug --help)
+
+	if ((CURRENT == 2)); then
+		_describe 'command' cmds
+		return
+	fi
+
+	case $words[CURRENT - 1] in
+	--icon)
+		presets=(${(f)"$(ffx icons 2>/dev/null | awk 'NF==2{print $1}')"})
+		_describe 'preset' presets
+		;;
+	--profile)
+		_files -/
+		;;
+	--radius | --name | --id | --args) ;;
+	*) _describe 'option' opts ;;
+	esac
+}
+
+_ffx "$@"
